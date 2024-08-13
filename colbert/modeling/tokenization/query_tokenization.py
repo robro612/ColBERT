@@ -2,8 +2,7 @@ import torch
 
 from colbert.modeling.hf_colbert import class_factory
 from colbert.infra import ColBERTConfig
-from colbert.modeling.tokenization.utils import _split_into_batches
-from colbert.utils.utils import batch
+from colbert.modeling.tokenization.utils import _split_into_batches, _insert_prefix_token
 from colbert.parameters import DEVICE
 
 
@@ -49,8 +48,69 @@ class QueryTokenizer():
         ids = [prefix + lst + suffix + [self.mask_token_id] * (self.query_maxlen - (len(lst)+3)) for lst in ids]
 
         return ids
-
+    
     def tensorize(self, batch_text, bsize=None, context=None, full_length_search=False):
+        assert type(batch_text) in [list, tuple], (type(batch_text))
+
+        # Full length search is only available for single inference (for now)
+        # Batched full length search requires far deeper changes to the code base
+        assert(full_length_search == False or (type(batch_text) == list and len(batch_text) == 1))
+
+        if full_length_search:
+            # Tokenize each string in the batch
+            un_truncated_ids = self.tok(batch_text, add_special_tokens=False).to(DEVICE)['input_ids']
+            # Get the longest length in the batch
+            max_length_in_batch = max(len(x) for x in un_truncated_ids)
+            # Set the max length
+            max_length = self.max_len(max_length_in_batch)
+        else:
+            # Max length is the default max length from the config
+            max_length = self.query_maxlen
+
+        # tokenize with max_length - 1 to add the marker id afterwards
+        obj = self.tok(batch_text, padding='max_length', truncation=True,
+                       return_tensors='pt', max_length=(max_length - 1)).to(DEVICE)
+
+        ids = _insert_prefix_token(obj['input_ids'], self.Q_marker_token_id)
+        mask = _insert_prefix_token(obj['attention_mask'], 1)
+
+        # postprocess for the [MASK] augmentation
+        ids[ids == self.pad_token_id] = self.mask_token_id
+
+        if context is not None:
+            assert len(context) == len(batch_text), (len(context), len(batch_text))
+
+            obj_2 = self.tok(context, padding='longest', truncation=True,
+                            return_tensors='pt', max_length=self.background_maxlen).to(DEVICE)
+
+            ids_2, mask_2 = obj_2['input_ids'][:, 1:], obj_2['attention_mask'][:, 1:]  # Skip the first [SEP]
+
+            ids = torch.cat((ids, ids_2), dim=-1)
+            mask = torch.cat((mask, mask_2), dim=-1)
+
+        if self.config.attend_to_mask_tokens:
+            mask[ids == self.mask_token_id] = 1
+            assert mask.sum().item() == mask.size(0) * mask.size(1), mask
+
+        if bsize:
+            batches = _split_into_batches(ids, mask, bsize)
+            return batches
+        
+        if self.used is False:
+            self.used = True
+
+            firstbg = (context is None) or context[0]
+            if self.verbose > 1:
+                print()
+                print("#> QueryTokenizer.tensorize(batch_text[0], batch_background[0], bsize) ==")
+                print(f"#> Input: {batch_text[0]}, \t\t {firstbg}, \t\t {bsize}")
+                print(f"#> Output IDs: {ids[0].size()}, {ids[0]}")
+                print(f"#> Output Mask: {mask[0].size()}, {mask[0]}")
+                print()
+
+        return ids, mask
+    
+    def old_tensorize(self, batch_text, bsize=None, context=None, full_length_search=False):
         assert type(batch_text) in [list, tuple], (type(batch_text))
 
         # add placehold for the [Q] marker
